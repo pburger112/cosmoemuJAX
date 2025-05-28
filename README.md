@@ -1,7 +1,7 @@
 <div align="center"><img src="docs/images/CosmoEmuJAX.png" width="500" height="400"> </div>
 
 ![](https://img.shields.io/badge/Python-181717?style=plastic&logo=python)
-![](https://img.shields.io/badge/JAX-181717?style=plastic&logo=JAX)
+![](https://img.shields.io/badge/JAX-181717?style=plastic&logo=jax)
 ![](https://img.shields.io/badge/Author-Pierre%20Burger%20-181717?style=plastic)
 
 
