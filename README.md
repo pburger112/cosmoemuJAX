@@ -3,7 +3,7 @@
 ![](https://img.shields.io/badge/Python-181717?style=plastic&logo=python)
 ![](https://img.shields.io/badge/JAX-181717?style=plastic&logo=JAX)
 ![](https://img.shields.io/badge/Author-Pierre%20Burger%20-181717?style=plastic)
-![](https://img.shields.io/badge/Installation-pip%20install%20cosmoemuJAX-181717?style=plastic)
+
 
 This package is oriented toward the CosmoPower and CosmoPower JAX emulators. However, it does train emulators similar to CosmoPower, but entirely in JAX. Therefore, it is independent of TensorFlow and can be easily used for gradient-dependent inferences. 
 
