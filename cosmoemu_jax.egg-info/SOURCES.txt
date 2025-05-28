@@ -1,0 +1,10 @@
+README.md
+setup.py
+cosmoemu_jax/__init__.py
+cosmoemu_jax/cosmoemu_jax.py
+cosmoemu_jax/train_emu_8para_jax.py
+cosmoemu_jax.egg-info/PKG-INFO
+cosmoemu_jax.egg-info/SOURCES.txt
+cosmoemu_jax.egg-info/dependency_links.txt
+cosmoemu_jax.egg-info/requires.txt
+cosmoemu_jax.egg-info/top_level.txt

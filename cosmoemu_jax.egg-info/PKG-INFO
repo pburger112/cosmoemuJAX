@@ -1,0 +1,27 @@
+Metadata-Version: 2.4
+Name: cosmoemu_jax
+Version: 0.1.0
+Summary: Code for emulating 2x3pt statistics
+Home-page: 
+Author: Pierre Burger
+Author-email: pierre.burger@uwaterloo.ca
+Requires-Python: >=3.10
+Requires-Dist: gdown
+Requires-Dist: matplotlib
+Provides-Extra: cpu
+Requires-Dist: numpy; extra == "cpu"
+Requires-Dist: jax; extra == "cpu"
+Requires-Dist: scipy; extra == "cpu"
+Requires-Dist: optax; extra == "cpu"
+Provides-Extra: gpu
+Requires-Dist: numpy<2.0; extra == "gpu"
+Requires-Dist: jax==0.4.20; extra == "gpu"
+Requires-Dist: jax-metal==0.0.5; extra == "gpu"
+Requires-Dist: scipy==1.11.4; extra == "gpu"
+Requires-Dist: optax==0.1.7; extra == "gpu"
+Dynamic: author
+Dynamic: author-email
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
