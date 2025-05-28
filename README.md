@@ -1,6 +1,6 @@
 # Emulator 3pt
 
-This package is orinatated on the CosmoPower and CosmoPower JAX emualtors. However, it does the training of emulators similar as in CosmoPower but complitely in JAX. Therefore it does not depend on Tensorflow and can therefore, easily be used for gradient denpendent inferences. 
+This package is oriented on the CosmoPower (https://github.com/alessiospuriomancini/cosmopower/tree/main) and CosmoPower JAX (https://github.com/dpiras/cosmopower-jax) emulators. However, it does the training of emulators similar to CosmoPower, but entirely in JAX. Therefore, it is independent of TensorFlow and can be easily used for gradient-dependent inferences. 
 
 ---
 
