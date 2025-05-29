@@ -65,18 +65,17 @@ The core dependencies for CPU (automatically installed) include:
 * optax
 * gdown
 * matplotlib
+* tqdm
+* getdist
 
 
-The core dependencies for GPU (automatically installed) include:
+The adjusted core dependencies for GPU (automatically installed) include:
 
 * numpy<2.0
 * jax==0.4.20
 * jax-metal==0.0.5
 * scipy==1.11.4
 * optax==0.1.7
-* gdown
-* matplotlib
-
 
 ---
 
