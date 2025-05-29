@@ -84,6 +84,7 @@ The adjusted core dependencies for GPU (automatically installed) include:
 * `cosmoemu_jax/`: Python file with the JAX emulator
 * `outputs/`: Folder where data is downloaded and emulators will be saved
 * `cosmoemu_jax_3times2pt.ipynb`: Notebook to demonstrate emulator use
+*  `HMC_example.ipynb`: Notebook to demonstrate emulator use for an HMC inference
 
 
 ---
