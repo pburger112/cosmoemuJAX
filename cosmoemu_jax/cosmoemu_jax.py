@@ -13,6 +13,7 @@ from jax import jacfwd, jacrev, jit
 from functools import partial
 import jax
 import optax
+from tqdm import trange
 
 class EmulatorJAX:
     """General-purpose JAX-based emulator for predicting features from input parameters using a neural network.
@@ -80,7 +81,20 @@ class EmulatorJAX:
         return jnp.multiply(jnp.add(b, jnp.multiply(sigmoid(jnp.multiply(a, x)), jnp.subtract(1., b))), x)
 
     @partial(jit, static_argnums=0)
-    def _predict(self, latent_params, input_vec):
+    def apply_dropout_fn(self,args):
+        act, key, rate = args
+        key, subkey = jax.random.split(key)
+        keep_prob = 1.0 - rate
+        mask = jax.random.bernoulli(subkey, p=keep_prob, shape=act.shape)
+        return mask * act / keep_prob
+
+    @partial(jit, static_argnums=0)
+    def no_dropout_fn(sel,args):
+        act, key, rate = args
+        return act
+
+    @partial(jit, static_argnums=0)
+    def _predict(self, latent_params, input_vec, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
         weights, hyper_params = latent_params
         layer_out = [input_vec]
 
@@ -88,44 +102,55 @@ class EmulatorJAX:
             w, b = weights[i]
             alpha, beta = hyper_params[i]
             act = jnp.dot(layer_out[-1], w.T) + b
-            layer_out.append(self._activation(act, alpha, beta))
-
+            
+            activated = self._activation(act, alpha, beta)
+            
+            activated = jax.lax.cond(
+                dropout_rate > 0.0,
+                self.apply_dropout_fn,
+                self.no_dropout_fn,
+                operand=(activated, key, dropout_rate)
+            )
+            
+            layer_out.append(activated)
+                
         w, b = weights[-1]
         preds = jnp.dot(layer_out[-1], w.T) + b
         return preds.squeeze()
+    
 
     @partial(jit, static_argnums=0)
-    def predict(self, latent_params, input_vec):
+    def predict(self, latent_params, input_vec, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
         
         if len(input_vec.shape) == 1:
             input_vec = input_vec.reshape(-1, self.n_parameters)
         assert len(input_vec.shape) == 2
 
-        return self._predict(latent_params, input_vec)
+        return self._predict(latent_params, input_vec, key, dropout_rate)
 
     
     @partial(jit, static_argnums=0)
-    def rescaled_predict(self, input_vec):
+    def rescaled_predict(self, input_vec, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
         """Return emulator prediction scaled to match physical values."""
         if isinstance(input_vec, dict):
             input_vec = self._dict_to_ordered_arr_jax(input_vec)
             
         input_vec = (input_vec - self.parameters_subtraction) / self.parameters_scaling
-        return self.predict(self.latent_params, input_vec) * self.features_scaling + self.features_subtraction
+        return self.predict(self.latent_params, input_vec, key, dropout_rate) * self.features_scaling + self.features_subtraction
 
     @partial(jit, static_argnums=0)
-    def ten_to_rescaled_predict(self, input_vec):
+    def ten_to_rescaled_predict(self, input_vec, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
         """Return 10^rescaled prediction, useful for log-scaled outputs."""
-        return 10 ** self.rescaled_predict(input_vec)
+        return 10 ** self.rescaled_predict(input_vec, key, dropout_rate)
 
     @partial(jit, static_argnums=0)
-    def compute_loss(self, latent_params, training_parameters, training_features):
-        predictions = self.predict(latent_params, training_parameters)
+    def compute_loss(self, latent_params, training_parameters, training_features, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
+        predictions = self.predict(latent_params, training_parameters, key, dropout_rate)
         return jnp.sqrt(jnp.mean((predictions - training_features) ** 2))
     
     @partial(jit, static_argnums=0)
-    def compute_gradients(self, latent_params, training_parameters, training_features):
-        loss_fn = lambda p: self.compute_loss(p, training_parameters, training_features)
+    def compute_gradients(self, latent_params, training_parameters, training_features, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
+        loss_fn = lambda p: self.compute_loss(p, training_parameters, training_features, key, dropout_rate)
         _, grads = jax.value_and_grad(loss_fn)(latent_params)
         return grads
 
@@ -145,6 +170,7 @@ class EmulatorJAX:
             update_lr=False,
             lr_decay=0.5,
             min_lr=1e-6,
+            dropout_rate=0.0,
             random_seed=0):
         """
         Trains the emulator using JAX and optax with internal validation split,
@@ -297,66 +323,72 @@ class EmulatorJAX:
         if verbose:
             print(f"Training with {n_samples} samples and {n_val} validation samples.")
 
+        onp.random.seed(random_seed)
         # === Training loop ===
-        for epoch in range(epochs):
-            # Shuffle training data each epoch
-            perm = jnp.array(onp.random.permutation(n_samples))
-            params_shuffled = training_parameters[perm]
-            features_shuffled = training_features[perm]
+        with trange(epochs) as t:
+            for epoch in t:
+                # Shuffle training data each epoch
+                perm = jnp.array(onp.random.permutation(n_samples))
+                params_shuffled = training_parameters[perm]
+                features_shuffled = training_features[perm]
 
-            # Mini-batch loop
-            for batch_idx in range(num_batches):
-                start = batch_idx * batch_size
-                end = min(start + batch_size, n_samples)
-                x_batch = params_shuffled[start:end]
-                y_batch = features_shuffled[start:end]
+                # Mini-batch loop
+                for batch_idx in range(num_batches):
+                    start = batch_idx * batch_size
+                    end = min(start + batch_size, n_samples)
+                    x_batch = params_shuffled[start:end]
+                    y_batch = features_shuffled[start:end]
 
-                grads = self.compute_gradients(latent_params, x_batch, y_batch)
-                updates, opt_state = optimizer.update(grads, opt_state)
-                latent_params = optax.apply_updates(latent_params, updates)
+                    key = jax.random.PRNGKey(batch_idx + epoch * num_batches)
+                    grads = self.compute_gradients(latent_params, x_batch, y_batch, key=key, dropout_rate=dropout_rate)
+                    updates, opt_state = optimizer.update(grads, opt_state)
+                    latent_params = optax.apply_updates(latent_params, updates)
 
-            # Evaluate full training and validation loss
-            full_train_loss = self.compute_loss(latent_params, training_parameters, training_features)
-            val_loss = self.compute_loss(latent_params, validation_parameters, validation_features)
-            losses.append(full_train_loss)
-            val_losses.append(val_loss)
+                # Evaluate full training and validation loss
+                full_train_loss = self.compute_loss(latent_params, training_parameters, training_features, dropout_rate=0.0)
+                val_loss = self.compute_loss(latent_params, validation_parameters, validation_features, dropout_rate=0.0)
+                losses.append(full_train_loss)
+                val_losses.append(val_loss)
+                
+                # update the progressbar
+                t.set_postfix(train_loss=full_train_loss,validation_loss=val_loss,learning_rate=learning_rate)
 
-            # === Learning rate scheduling OR early stopping ===
-            if update_lr:
-                if val_loss < best_val_loss - 1e-6:
-                    best_val_loss = val_loss
-                    best_params = latent_params
-                    wait = 0
+                # === Learning rate scheduling OR early stopping ===
+                if update_lr:
+                    if val_loss < best_val_loss - 1e-6:
+                        best_val_loss = val_loss
+                        best_params = latent_params
+                        wait = 0
+                    else:
+                        wait += 1
+                        if wait >= patience:
+                            new_lr = max(learning_rate * lr_decay, min_lr)
+                            if new_lr < learning_rate:
+                                learning_rate = new_lr
+                                optimizer = create_optimizer(learning_rate)
+                                latent_params = best_params
+                                opt_state = optimizer.init(latent_params)
+                                wait = 0
+                                if verbose:
+                                    print(f"Epoch {epoch}: Reducing learning rate to {learning_rate:.2e}")
+                            else:
+                                if verbose:
+                                    print(f"Epoch {epoch}: Learning rate already at minimum {min_lr}")
+                                break  # Early stopping
                 else:
-                    wait += 1
-                    if wait >= patience:
-                        new_lr = max(learning_rate * lr_decay, min_lr)
-                        if new_lr < learning_rate:
-                            learning_rate = new_lr
-                            optimizer = create_optimizer(learning_rate)
-                            latent_params = best_params
-                            opt_state = optimizer.init(latent_params)
-                            wait = 0
-                            if verbose:
-                                print(f"Epoch {epoch}: Reducing learning rate to {learning_rate:.2e}")
-                        else:
-                            if verbose:
-                                print(f"Epoch {epoch}: Learning rate already at minimum {min_lr}")
+                    # Only early stopping
+                    if val_loss < best_val_loss - 1e-6:
+                        best_val_loss = val_loss
+                        best_params = latent_params
+                        wait = 0
+                    else:
+                        wait += 1
+                        if wait >= patience:
                             break  # Early stopping
-            else:
-                # Only early stopping
-                if val_loss < best_val_loss - 1e-6:
-                    best_val_loss = val_loss
-                    best_params = latent_params
-                    wait = 0
-                else:
-                    wait += 1
-                    if wait >= patience:
-                        break  # Early stopping
 
-            # Optional logging
-            if verbose and epoch % 50 == 0:
-                print(f"Epoch {epoch:4d}, Train Loss: {full_train_loss:.6f}, Val Loss: {val_loss:.6f}")
+                # # Optional logging
+                # if verbose and epoch % 50 == 0:
+                #     print(f"Epoch {epoch:4d}, Train Loss: {full_train_loss:.6f}, Val Loss: {val_loss:.6f}")
 
         # === Save best weights and stats ===
         self.latent_params = best_params

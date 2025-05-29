@@ -8,6 +8,7 @@ Author-email: pierre.burger@uwaterloo.ca
 Requires-Python: >=3.10
 Requires-Dist: gdown
 Requires-Dist: matplotlib
+Requires-Dist: blackjax
 Provides-Extra: cpu
 Requires-Dist: numpy; extra == "cpu"
 Requires-Dist: jax; extra == "cpu"

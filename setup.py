@@ -12,6 +12,9 @@ setup(
         
         'gdown',
         'matplotlib',
+        'blackjax',
+        'tqdm',
+        'getdist',
         
     ],
     extras_require={

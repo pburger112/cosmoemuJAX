@@ -1,5 +1,6 @@
 gdown
 matplotlib
+blackjax
 
 [cpu]
 numpy

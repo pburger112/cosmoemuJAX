@@ -80,7 +80,7 @@ class EmulatorJAX:
         return jnp.multiply(jnp.add(b, jnp.multiply(sigmoid(jnp.multiply(a, x)), jnp.subtract(1., b))), x)
 
     @partial(jit, static_argnums=0)
-    def _predict(self, latent_params, input_vec):
+    def _predict(self, latent_params, input_vec, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
         weights, hyper_params = latent_params
         layer_out = [input_vec]
 
@@ -88,44 +88,57 @@ class EmulatorJAX:
             w, b = weights[i]
             alpha, beta = hyper_params[i]
             act = jnp.dot(layer_out[-1], w.T) + b
-            layer_out.append(self._activation(act, alpha, beta))
+            
+            # # Batch normalization (no affine transformation here, but could add gamma & beta)
+            # mean = jnp.mean(act, axis=0, keepdims=True)
+            # var = jnp.var(act, axis=0, keepdims=True)
+            # act = (act - mean) / jnp.sqrt(var + 1e-5)
+            
+            activated = self._activation(act, alpha, beta)
+            
+            # Dropout
+            key, subkey = jax.random.split(key)
+            activated = jax.random.bernoulli(subkey, p=1.0 - dropout_rate, shape=activated.shape) * activated / (1.0 - dropout_rate)
+            # activated = jax.nn.dropout(subkey, activated, rate=dropout_rate)
 
+            layer_out.append(activated)
+                
         w, b = weights[-1]
         preds = jnp.dot(layer_out[-1], w.T) + b
         return preds.squeeze()
 
     @partial(jit, static_argnums=0)
-    def predict(self, latent_params, input_vec):
+    def predict(self, latent_params, input_vec, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
         
         if len(input_vec.shape) == 1:
             input_vec = input_vec.reshape(-1, self.n_parameters)
         assert len(input_vec.shape) == 2
 
-        return self._predict(latent_params, input_vec)
+        return self._predict(latent_params, input_vec, key, dropout_rate)
 
     
     @partial(jit, static_argnums=0)
-    def rescaled_predict(self, input_vec):
+    def rescaled_predict(self, input_vec, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
         """Return emulator prediction scaled to match physical values."""
         if isinstance(input_vec, dict):
             input_vec = self._dict_to_ordered_arr_jax(input_vec)
             
         input_vec = (input_vec - self.parameters_subtraction) / self.parameters_scaling
-        return self.predict(self.latent_params, input_vec) * self.features_scaling + self.features_subtraction
+        return self.predict(self.latent_params, input_vec, key, dropout_rate) * self.features_scaling + self.features_subtraction
 
     @partial(jit, static_argnums=0)
-    def ten_to_rescaled_predict(self, input_vec):
+    def ten_to_rescaled_predict(self, input_vec, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
         """Return 10^rescaled prediction, useful for log-scaled outputs."""
-        return 10 ** self.rescaled_predict(input_vec)
+        return 10 ** self.rescaled_predict(input_vec, key, dropout_rate)
 
     @partial(jit, static_argnums=0)
-    def compute_loss(self, latent_params, training_parameters, training_features):
-        predictions = self.predict(latent_params, training_parameters)
+    def compute_loss(self, latent_params, training_parameters, training_features, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
+        predictions = self.predict(latent_params, training_parameters, key, dropout_rate)
         return jnp.sqrt(jnp.mean((predictions - training_features) ** 2))
     
     @partial(jit, static_argnums=0)
-    def compute_gradients(self, latent_params, training_parameters, training_features):
-        loss_fn = lambda p: self.compute_loss(p, training_parameters, training_features)
+    def compute_gradients(self, latent_params, training_parameters, training_features, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
+        loss_fn = lambda p: self.compute_loss(p, training_parameters, training_features, key, dropout_rate)
         _, grads = jax.value_and_grad(loss_fn)(latent_params)
         return grads
 
@@ -145,6 +158,7 @@ class EmulatorJAX:
             update_lr=False,
             lr_decay=0.5,
             min_lr=1e-6,
+            dropout_rate=0.0,
             random_seed=0):
         """
         Trains the emulator using JAX and optax with internal validation split,
@@ -297,6 +311,7 @@ class EmulatorJAX:
         if verbose:
             print(f"Training with {n_samples} samples and {n_val} validation samples.")
 
+        onp.random.seed(random_seed)
         # === Training loop ===
         for epoch in range(epochs):
             # Shuffle training data each epoch
@@ -311,13 +326,14 @@ class EmulatorJAX:
                 x_batch = params_shuffled[start:end]
                 y_batch = features_shuffled[start:end]
 
-                grads = self.compute_gradients(latent_params, x_batch, y_batch)
+                key = jax.random.PRNGKey(batch_idx + epoch * num_batches)
+                grads = self.compute_gradients(latent_params, x_batch, y_batch, key=key, dropout_rate=dropout_rate)
                 updates, opt_state = optimizer.update(grads, opt_state)
                 latent_params = optax.apply_updates(latent_params, updates)
 
             # Evaluate full training and validation loss
-            full_train_loss = self.compute_loss(latent_params, training_parameters, training_features)
-            val_loss = self.compute_loss(latent_params, validation_parameters, validation_features)
+            full_train_loss = self.compute_loss(latent_params, training_parameters, training_features, dropout_rate=0.0)
+            val_loss = self.compute_loss(latent_params, validation_parameters, validation_features, dropout_rate=0.0)
             losses.append(full_train_loss)
             val_losses.append(val_loss)
 
