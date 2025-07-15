@@ -46,10 +46,7 @@ class EmulatorJAX:
                 print(f"Loaded keys: {loaded_variable_dict.keys()}")
 
 
-            self.latent_params = self._convert_weights_to_jax(
-                    loaded_variable_dict['weights'], 
-                    loaded_variable_dict['hyper_params']
-            )
+            self.latent_params = self._convert_latent_params_to_jax(loaded_variable_dict['latent_params'])
 
             self.parameters = loaded_variable_dict['parameters']  
             self.n_parameters = loaded_variable_dict['n_parameters']
@@ -61,10 +58,9 @@ class EmulatorJAX:
             self.parameters_scaling = loaded_variable_dict['parameters_scaling']
           
     
-    def _convert_weights_to_jax(self, weights, hyper_params):
-                weights_jax = [(jnp.array(w), jnp.array(b)) for w, b in weights]
-                hyper_params_jax = [(jnp.array(a), jnp.array(bh)) for a, bh in hyper_params]
-                return (weights_jax, hyper_params_jax)  
+    def _convert_latent_params_to_jax(self, latent_params):
+                latent_params_jax = [(jnp.array(w), jnp.array(b)) for w, b in latent_params]
+                return latent_params_jax  
         
     def _dict_to_ordered_arr_jax(self, input_dict):
         """Convert dictionary of input parameters to ordered array based on trained model."""
@@ -74,12 +70,12 @@ class EmulatorJAX:
             return jnp.stack([input_dict[k] for k in input_dict], axis=1)
 
     @partial(jit, static_argnums=0)
-    def _activation(self, x, a, b):
+    def _activation(self, x):
         """Custom activation function as used in training.
-        Parameters `a` and `b` control the nonlinearity.
         """
         return jax.nn.gelu(x)
-        # return jnp.multiply(jnp.add(b, jnp.multiply(sigmoid(jnp.multiply(a, x)), jnp.subtract(1., b))), x)
+        # return sigmoid(x)
+
 
     @partial(jit, static_argnums=0)
     def apply_dropout_fn(self,args):
@@ -96,15 +92,13 @@ class EmulatorJAX:
 
     @partial(jit, static_argnums=0)
     def _predict(self, latent_params, input_vec, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
-        weights, hyper_params = latent_params
         layer_out = [input_vec]
 
-        for i in range(len(weights) - 1):
-            w, b = weights[i]
-            alpha, beta = hyper_params[i]
+        for i in range(len(latent_params) - 1):
+            w, b = latent_params[i]
             act = jnp.dot(layer_out[-1], w.T) + b
             
-            activated = self._activation(act, alpha, beta)
+            activated = self._activation(act)
             
             activated = jax.lax.cond(
                 dropout_rate > 0.0,
@@ -115,7 +109,7 @@ class EmulatorJAX:
             
             layer_out.append(activated)
                 
-        w, b = weights[-1]
+        w, b = latent_params[-1]
         preds = jnp.dot(layer_out[-1], w.T) + b
         return preds.squeeze()
     
@@ -145,13 +139,13 @@ class EmulatorJAX:
         return 10 ** self.rescaled_predict(input_vec, key, dropout_rate)
 
     @partial(jit, static_argnums=0)
-    def compute_loss(self, latent_params, training_parameters, training_features, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
+    def compute_loss(self, latent_params, training_parameters, training_features, weights_features, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
         predictions = self.predict(latent_params, training_parameters, key, dropout_rate)
-        return jnp.sqrt(jnp.mean((predictions - training_features) ** 2))
+        return jnp.mean((predictions - training_features) ** 2 * weights_features)
     
     @partial(jit, static_argnums=0)
-    def compute_gradients(self, latent_params, training_parameters, training_features, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
-        loss_fn = lambda p: self.compute_loss(p, training_parameters, training_features, key, dropout_rate)
+    def compute_gradients(self, latent_params, training_parameters, training_features, weights_features, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
+        loss_fn = lambda p: self.compute_loss(p, training_parameters, training_features, weights_features, key, dropout_rate)
         _, grads = jax.value_and_grad(loss_fn)(latent_params)
         return grads
 
@@ -159,6 +153,7 @@ class EmulatorJAX:
             parameters,
             raw_training_parameters,
             raw_training_features,
+            weights_features = None,
             normalise_mode = 'mean_sigma',
             learning_rate=1e-3,
             epochs=1000,
@@ -172,6 +167,7 @@ class EmulatorJAX:
             lr_decay=0.5,
             min_lr=1e-6,
             dropout_rate=0.0,
+            weight_decay=0.0,
             random_seed=0):
         """
         Trains the emulator using JAX and optax with internal validation split,
@@ -217,6 +213,13 @@ class EmulatorJAX:
         # Convert dict input to ordered array if needed
         if isinstance(raw_training_parameters, dict):
             raw_training_parameters = self._dict_to_ordered_arr_jax(raw_training_parameters)
+            
+        # set weights of features in case you want to specify some of the features more than others.
+        if(weights_features is None):
+            weights_features = jnp.ones(raw_training_features.shape[1])
+        else:
+            weights_features = jnp.array(weights_features)
+
 
         # === Shuffle and split into training/validation sets ===
         n_total = raw_training_parameters.shape[0]
@@ -247,6 +250,7 @@ class EmulatorJAX:
             training_features = (train_features_raw - features_subtraction) / features_scaling
             validation_parameters = (val_params_raw - parameters_subtraction) / parameters_scaling
             validation_features = (val_features_raw - features_subtraction) / features_scaling
+        
             
         elif(normalise_mode == 'min_max'):
             
@@ -260,6 +264,7 @@ class EmulatorJAX:
             training_features = (train_features_raw - features_subtraction) / features_scaling
             validation_parameters = (val_params_raw - parameters_subtraction) / parameters_scaling
             validation_features = (val_features_raw - features_subtraction) / features_scaling
+     
         
         else:
             
@@ -275,6 +280,9 @@ class EmulatorJAX:
             training_features = train_features_raw 
             validation_parameters = val_params_raw
             validation_features = val_features_raw
+            
+            
+        
         
             
         # Store normalization values for inference
@@ -291,25 +299,19 @@ class EmulatorJAX:
         n_outputs = training_features.shape[1]
         layer_sizes = [n_inputs] + self.n_hidden + [n_outputs]
 
-        weights, hyper_params = [], []
+        latent_params = []
         for i in range(len(layer_sizes) - 1):
             rng, key_w, key_b = random.split(rng, 3)
             fan_in, fan_out = layer_sizes[i], layer_sizes[i + 1]
             limit = jnp.sqrt(6 / (fan_in + fan_out))  # Glorot uniform init
             W = random.uniform(key_w, shape=(fan_out, fan_in), minval=-limit, maxval=limit)
             b = jnp.zeros(fan_out)
-            weights.append((W, b))
-            
-            # If not the final layer, add hyperparameters for custom activation
-            if i < len(layer_sizes) - 2:
-                a = jnp.ones(fan_out)
-                b_h = jnp.ones(fan_out) * 0.1
-                hyper_params.append((a, b_h))
-
-        latent_params = (weights, hyper_params)
+            latent_params.append((W, b))
 
         # === Set up optimizer ===
-        def create_optimizer(lr): return optax.adam(lr)
+        def create_optimizer(lr): 
+            return optax.adamw(learning_rate=lr, weight_decay=weight_decay)
+        
         optimizer = create_optimizer(learning_rate)
         opt_state = optimizer.init(latent_params)
 
@@ -341,13 +343,13 @@ class EmulatorJAX:
                     y_batch = features_shuffled[start:end]
 
                     key = jax.random.PRNGKey(batch_idx + epoch * num_batches)
-                    grads = self.compute_gradients(latent_params, x_batch, y_batch, key=key, dropout_rate=dropout_rate)
-                    updates, opt_state = optimizer.update(grads, opt_state)
+                    grads = self.compute_gradients(latent_params, x_batch, y_batch, weights_features, key=key, dropout_rate=dropout_rate)
+                    updates, opt_state = optimizer.update(grads, opt_state, params=latent_params)
                     latent_params = optax.apply_updates(latent_params, updates)
 
                 # Evaluate full training and validation loss
-                full_train_loss = self.compute_loss(latent_params, training_parameters, training_features, dropout_rate=0.0)
-                val_loss = self.compute_loss(latent_params, validation_parameters, validation_features, dropout_rate=0.0)
+                full_train_loss = self.compute_loss(latent_params, training_parameters, training_features, weights_features, dropout_rate=0.0)
+                val_loss = self.compute_loss(latent_params, validation_parameters, validation_features, weights_features, dropout_rate=0.0)
                 losses.append(full_train_loss)
                 val_losses.append(val_loss)
                 
@@ -398,8 +400,7 @@ class EmulatorJAX:
         
         # Save to disk as a .npz file (weights as object arrays)
         onp.savez(save_fn, 
-                weights=onp.array(self.latent_params[0], dtype=object),
-                hyper_params=self.latent_params[1],
+                latent_params=onp.array(self.latent_params, dtype=object),
                 parameters=self.parameters,
                 n_parameters=self.n_parameters,
                 parameters_subtraction=self.parameters_subtraction,

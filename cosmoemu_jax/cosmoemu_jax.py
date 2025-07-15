@@ -25,18 +25,24 @@ class EmulatorJAX:
     ----------
     filepath : string
         Full path to the .pkl file containing the pretrained model.
+    n_hidden : list of int
+        Hidden layer sizes.
+    activation : str
+        Activation function to use in the hidden layers. Options include:
+        'gelu', 'relu', 'tanh', 'sigmoid', 'selu', 'softplus', 'swish', 'elu', 'leaky_relu'.
     verbose : bool, default=True
         Whether to print information during initialization.
     """
 
-    def __init__(self, filepath=None,
+    def __init__(self, filepath=None, 
+                 n_hidden=[32]*4, activation="gelu",
                  verbose=True):
         """
         JAX-based emulator for predicting features from input parameters.
 
         If `filepath` is given, loads pretrained model. Otherwise, initializes with provided components.
         """
-
+        
         if filepath is not None:
             if verbose:
                 print(f"Loading model from {filepath}")
@@ -45,11 +51,11 @@ class EmulatorJAX:
             if verbose:
                 print(f"Loaded keys: {loaded_variable_dict.keys()}")
 
+            self.n_hidden = loaded_variable_dict['n_hidden']
+            self.activation = loaded_variable_dict['activation']
+            self.activation_fn = self._get_activation_from_name(activation)
 
-            self.latent_params = self._convert_weights_to_jax(
-                    loaded_variable_dict['weights'], 
-                    loaded_variable_dict['hyper_params']
-            )
+            self.latent_params = self._convert_latent_params_to_jax(loaded_variable_dict['latent_params'])
 
             self.parameters = loaded_variable_dict['parameters']  
             self.n_parameters = loaded_variable_dict['n_parameters']
@@ -59,12 +65,39 @@ class EmulatorJAX:
             
             self.parameters_subtraction = loaded_variable_dict['parameters_subtraction']
             self.parameters_scaling = loaded_variable_dict['parameters_scaling']
-          
+            
+            # === Set up loss function type ===
+            if loaded_variable_dict['loss_fct_type'] == 'MSE':
+                self.loss_power_spectrum = 1
+            else:
+                self.loss_power_spectrum = 0.5
+                    
+        else:
+            self.n_hidden = n_hidden
+            self.activation = activation
+            self.activation_fn = self._get_activation_from_name(activation)
     
-    def _convert_weights_to_jax(self, weights, hyper_params):
-                weights_jax = [(jnp.array(w), jnp.array(b)) for w, b in weights]
-                hyper_params_jax = [(jnp.array(a), jnp.array(bh)) for a, bh in hyper_params]
-                return (weights_jax, hyper_params_jax)  
+    def _get_activation_from_name(self, name):
+        activations = {
+            "gelu": jax.nn.gelu,
+            "relu": jax.nn.relu,
+            "tanh": jax.numpy.tanh,
+            "sigmoid": jax.nn.sigmoid,
+            "softplus": jax.nn.softplus,
+            "swish": lambda x: x * sigmoid(x),
+            "elu": jax.nn.elu,
+            "leaky_relu": jax.nn.leaky_relu,
+            "selu": jax.nn.selu,
+            
+        }
+        if name not in activations:
+            raise ValueError(f"Unknown activation function name: {name}")
+        return activations[name]
+
+   
+    def _convert_latent_params_to_jax(self, latent_params):
+                latent_params_jax = [(jnp.array(w), jnp.array(b)) for w, b in latent_params]
+                return latent_params_jax  
         
     def _dict_to_ordered_arr_jax(self, input_dict):
         """Convert dictionary of input parameters to ordered array based on trained model."""
@@ -74,11 +107,11 @@ class EmulatorJAX:
             return jnp.stack([input_dict[k] for k in input_dict], axis=1)
 
     @partial(jit, static_argnums=0)
-    def _activation(self, x, a, b):
+    def _activation(self, x):
         """Custom activation function as used in training.
-        Parameters `a` and `b` control the nonlinearity.
         """
-        return jnp.multiply(jnp.add(b, jnp.multiply(sigmoid(jnp.multiply(a, x)), jnp.subtract(1., b))), x)
+        return self.activation_fn(x)
+    
 
     @partial(jit, static_argnums=0)
     def apply_dropout_fn(self,args):
@@ -95,15 +128,13 @@ class EmulatorJAX:
 
     @partial(jit, static_argnums=0)
     def _predict(self, latent_params, input_vec, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
-        weights, hyper_params = latent_params
         layer_out = [input_vec]
 
-        for i in range(len(weights) - 1):
-            w, b = weights[i]
-            alpha, beta = hyper_params[i]
+        for i in range(len(latent_params) - 1):
+            w, b = latent_params[i]
             act = jnp.dot(layer_out[-1], w.T) + b
             
-            activated = self._activation(act, alpha, beta)
+            activated = self._activation(act)
             
             activated = jax.lax.cond(
                 dropout_rate > 0.0,
@@ -114,7 +145,7 @@ class EmulatorJAX:
             
             layer_out.append(activated)
                 
-        w, b = weights[-1]
+        w, b = latent_params[-1]
         preds = jnp.dot(layer_out[-1], w.T) + b
         return preds.squeeze()
     
@@ -144,13 +175,13 @@ class EmulatorJAX:
         return 10 ** self.rescaled_predict(input_vec, key, dropout_rate)
 
     @partial(jit, static_argnums=0)
-    def compute_loss(self, latent_params, training_parameters, training_features, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
+    def compute_loss(self, latent_params, training_parameters, training_features, weights_features, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
         predictions = self.predict(latent_params, training_parameters, key, dropout_rate)
-        return jnp.sqrt(jnp.mean((predictions - training_features) ** 2))
+        return jnp.power(jnp.mean((predictions - training_features) ** 2 * weights_features),self.loss_power_spectrum)  # MSE or RMSE loss
     
     @partial(jit, static_argnums=0)
-    def compute_gradients(self, latent_params, training_parameters, training_features, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
-        loss_fn = lambda p: self.compute_loss(p, training_parameters, training_features, key, dropout_rate)
+    def compute_gradients(self, latent_params, training_parameters, training_features, weights_features, key = jax.random.PRNGKey(0), dropout_rate = 0.0):
+        loss_fn = lambda p: self.compute_loss(p, training_parameters, training_features, weights_features, key, dropout_rate)
         _, grads = jax.value_and_grad(loss_fn)(latent_params)
         return grads
 
@@ -158,56 +189,86 @@ class EmulatorJAX:
             parameters,
             raw_training_parameters,
             raw_training_features,
+            weights_features = None,
+            
+            # Hyperparameters for training
             normalise_mode = 'mean_sigma',
             learning_rate=1e-3,
             epochs=1000,
-            n_hidden=[32]*4,
-            save_fn=None,
-            verbose=True,
             batch_size=64,
             patience=1000,
             validation_split=0.1,
+            loss_fct_type = 'MSE',
             update_lr=False,
             lr_decay=0.5,
             min_lr=1e-6,
             dropout_rate=0.0,
-            random_seed=0):
+            weight_decay=0.0,
+            
+            random_seed=0,
+            
+            save_fn=None,
+            verbose=True):
+        
         """
-        Trains the emulator using JAX and optax with internal validation split,
-        mini-batching, and adaptive learning rate scheduling.
+        Trains the emulator using JAX and Optax with internal validation split,
+        mini-batching, early stopping, and optional learning rate scheduling.
 
         Parameters
         ----------
         parameters : list of str
             Names of the input parameters (used for ordering and tracking).
         raw_training_parameters : dict or jnp.ndarray
-            Full dataset of input parameters.
+            Input parameter samples for training. Can be a dictionary or array.
         raw_training_features : jnp.ndarray
-            Full dataset of output features.
-        learning_rate : float
+            Output features corresponding to the input parameters.
+        weights_features : array-like or None, optional
+            Optional 1D array of shape (n_features,) to apply per-feature loss weighting.
+            Default is uniform weighting (i.e., all ones).
+        normalise_mode : str, optional
+            Normalization mode for input and output data.
+            - 'mean_sigma': Standardization using mean and standard deviation.
+            - 'min_max'   : Scale features to [0, 1] range.
+            - 'none'      : No normalization applied (not recommended).
+        learning_rate : float, optional
             Initial learning rate for the optimizer.
-        epochs : int
-            Number of training epochs.
-        n_hidden : list of int
-            Hidden layer sizes.
-        save_fn : str
-            Path to save the trained model parameters.
-        verbose : bool
-            If True, print training progress.
-        batch_size : int
-            Size of each mini-batch during training.
-        patience : int
-            Number of epochs to wait for improvement before early stopping.
-        validation_split : float
-            Fraction of data used for validation.
-        update_lr : bool
-            Whether to reduce learning rate on plateau.
-        lr_decay : float
-            Factor by which to reduce the learning rate.
-        min_lr : float
-            Minimum learning rate threshold.
-        random_seed : int
-            Random seed for reproducibility.
+        epochs : int, optional
+            Total number of training epochs.
+        batch_size : int, optional
+            Size of each mini-batch for training.
+        patience : int, optional
+            Number of epochs to wait before triggering learning rate decay or early stopping.
+        validation_split : float, optional
+            Fraction of the training data used for validation.
+        loss_fct_type : str, optional
+            Type of loss function to use: 
+            - 'MSE': Mean Squared Error
+            - 'RMSE': Root Mean Squared Error
+        update_lr : bool, optional
+            Whether to apply learning rate decay on validation plateau.
+        lr_decay : float, optional
+            Multiplicative factor to reduce learning rate by when no improvement is seen.
+        min_lr : float, optional
+            Lower bound for the learning rate during decay.
+        dropout_rate : float, optional
+            Dropout rate applied during training (0.0 = no dropout).
+        weight_decay : float, optional
+            L2 regularization strength.
+        random_seed : int, optional
+            Seed for random number generators (JAX and NumPy).
+        save_fn : str or None, optional
+            File path to save the trained model. If None, no file is saved.
+        verbose : bool, optional
+            Whether to print training progress and logs.
+
+        Saves
+        -----
+        If `save_fn` is provided, the model saves:
+            - Trained weights (`latent_params`)
+            - Normalization statistics
+            - Input parameter names and shapes
+            - Training and validation losses
+            - Loss function type, hidden layer structure, activation type
         """
 
         self.parameters = parameters
@@ -216,6 +277,13 @@ class EmulatorJAX:
         # Convert dict input to ordered array if needed
         if isinstance(raw_training_parameters, dict):
             raw_training_parameters = self._dict_to_ordered_arr_jax(raw_training_parameters)
+            
+        # set weights of features in case you want to specify some of the features more than others.
+        if(weights_features is None):
+            weights_features = jnp.ones(raw_training_features.shape[1])
+        else:
+            weights_features = jnp.array(weights_features)
+
 
         # === Shuffle and split into training/validation sets ===
         n_total = raw_training_parameters.shape[0]
@@ -246,6 +314,7 @@ class EmulatorJAX:
             training_features = (train_features_raw - features_subtraction) / features_scaling
             validation_parameters = (val_params_raw - parameters_subtraction) / parameters_scaling
             validation_features = (val_features_raw - features_subtraction) / features_scaling
+        
             
         elif(normalise_mode == 'min_max'):
             
@@ -259,6 +328,7 @@ class EmulatorJAX:
             training_features = (train_features_raw - features_subtraction) / features_scaling
             validation_parameters = (val_params_raw - parameters_subtraction) / parameters_scaling
             validation_features = (val_features_raw - features_subtraction) / features_scaling
+     
         
         else:
             
@@ -274,7 +344,6 @@ class EmulatorJAX:
             training_features = train_features_raw 
             validation_parameters = val_params_raw
             validation_features = val_features_raw
-        
             
         # Store normalization values for inference
         self.parameters_subtraction = parameters_subtraction
@@ -282,7 +351,7 @@ class EmulatorJAX:
         self.features_subtraction = features_subtraction
         self.features_scaling = features_scaling
         
-        self.n_hidden = n_hidden
+        
 
         # === Initialize neural network weights and biases ===
         rng = random.PRNGKey(random_seed)
@@ -290,25 +359,19 @@ class EmulatorJAX:
         n_outputs = training_features.shape[1]
         layer_sizes = [n_inputs] + self.n_hidden + [n_outputs]
 
-        weights, hyper_params = [], []
+        latent_params = []
         for i in range(len(layer_sizes) - 1):
             rng, key_w, key_b = random.split(rng, 3)
             fan_in, fan_out = layer_sizes[i], layer_sizes[i + 1]
             limit = jnp.sqrt(6 / (fan_in + fan_out))  # Glorot uniform init
             W = random.uniform(key_w, shape=(fan_out, fan_in), minval=-limit, maxval=limit)
             b = jnp.zeros(fan_out)
-            weights.append((W, b))
-            
-            # If not the final layer, add hyperparameters for custom activation
-            if i < len(layer_sizes) - 2:
-                a = jnp.ones(fan_out)
-                b_h = jnp.ones(fan_out) * 0.1
-                hyper_params.append((a, b_h))
-
-        latent_params = (weights, hyper_params)
+            latent_params.append((W, b))
 
         # === Set up optimizer ===
-        def create_optimizer(lr): return optax.adam(lr)
+        def create_optimizer(lr): 
+            return optax.adamw(learning_rate=lr, weight_decay=weight_decay)
+        
         optimizer = create_optimizer(learning_rate)
         opt_state = optimizer.init(latent_params)
 
@@ -319,6 +382,14 @@ class EmulatorJAX:
         best_val_loss = float('inf')
         best_params = None
         wait = 0  # Counter for early stopping / LR scheduling
+        
+        # === Set up loss function type ===
+        if loss_fct_type == 'MSE':
+            self.loss_power_spectrum = 1
+        elif loss_fct_type == 'RMSE':
+            self.loss_power_spectrum = 0.5
+        else:
+            raise ValueError(f"Unsupported loss function type: {loss_fct_type}. Choose 'MSE' or 'RMSE'.")
 
         if verbose:
             print(f"Training with {n_samples} samples and {n_val} validation samples.")
@@ -340,13 +411,13 @@ class EmulatorJAX:
                     y_batch = features_shuffled[start:end]
 
                     key = jax.random.PRNGKey(batch_idx + epoch * num_batches)
-                    grads = self.compute_gradients(latent_params, x_batch, y_batch, key=key, dropout_rate=dropout_rate)
-                    updates, opt_state = optimizer.update(grads, opt_state)
+                    grads = self.compute_gradients(latent_params, x_batch, y_batch, weights_features, key=key, dropout_rate=dropout_rate)
+                    updates, opt_state = optimizer.update(grads, opt_state, params=latent_params)
                     latent_params = optax.apply_updates(latent_params, updates)
 
                 # Evaluate full training and validation loss
-                full_train_loss = self.compute_loss(latent_params, training_parameters, training_features, dropout_rate=0.0)
-                val_loss = self.compute_loss(latent_params, validation_parameters, validation_features, dropout_rate=0.0)
+                full_train_loss = self.compute_loss(latent_params, training_parameters, training_features, weights_features, dropout_rate=0.0)
+                val_loss = self.compute_loss(latent_params, validation_parameters, validation_features, weights_features, dropout_rate=0.0)
                 losses.append(full_train_loss)
                 val_losses.append(val_loss)
                 
@@ -397,8 +468,7 @@ class EmulatorJAX:
         
         # Save to disk as a .npz file (weights as object arrays)
         onp.savez(save_fn, 
-                weights=onp.array(self.latent_params[0], dtype=object),
-                hyper_params=self.latent_params[1],
+                latent_params=onp.array(self.latent_params, dtype=object),
                 parameters=self.parameters,
                 n_parameters=self.n_parameters,
                 parameters_subtraction=self.parameters_subtraction,
@@ -407,5 +477,9 @@ class EmulatorJAX:
                 features_scaling=self.features_scaling,
                 training_range=training_range,
                 train_loss=losses,
-                val_losses=val_losses
+                val_losses=val_losses,
+                loss_fct_type=loss_fct_type,
+                random_seed=random_seed,
+                n_hidden = self.n_hidden,
+                activation = self.activation 
                 )
